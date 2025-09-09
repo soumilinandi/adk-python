@@ -17,14 +17,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
-import time
 from typing import Any
 from typing import AsyncGenerator
 from typing import Callable
 from typing import Generator
 from typing import List
 from typing import Optional
-import uuid
 import warnings
 
 from google.genai import types
@@ -36,6 +34,7 @@ from .agents.invocation_context import new_invocation_context_id
 from .agents.live_request_queue import LiveRequestQueue
 from .agents.llm_agent import LlmAgent
 from .agents.run_config import RunConfig
+from .apps.app import App
 from .artifacts.base_artifact_service import BaseArtifactService
 from .artifacts.in_memory_artifact_service import InMemoryArtifactService
 from .auth.credential_service.base_credential_service import BaseCredentialService
@@ -53,6 +52,7 @@ from .sessions.in_memory_session_service import InMemorySessionService
 from .sessions.session import Session
 from .telemetry import tracer
 from .tools.base_toolset import BaseToolset
+from .utils.context_utils import Aclosing
 
 logger = logging.getLogger('google_adk.' + __name__)
 
@@ -71,6 +71,7 @@ class Runner:
       plugin_manager: The plugin manager for the runner.
       session_service: The session service for the runner.
       memory_service: The memory service for the runner.
+      credential_service: The credential service for the runner.
   """
 
   app_name: str
@@ -91,8 +92,9 @@ class Runner:
   def __init__(
       self,
       *,
-      app_name: str,
-      agent: BaseAgent,
+      app: Optional[App] = None,
+      app_name: Optional[str] = None,
+      agent: Optional[BaseAgent] = None,
       plugins: Optional[List[BasePlugin]] = None,
       artifact_service: Optional[BaseArtifactService] = None,
       session_service: BaseSessionService,
@@ -101,20 +103,84 @@ class Runner:
   ):
     """Initializes the Runner.
 
+    Developers should provide either an `app` instance or both `app_name` and
+    `agent`. Providing a mix of `app` and `app_name`/`agent` will result in a
+    `ValueError`. Providing `app` is the recommended way to create a runner.
+
     Args:
-        app_name: The application name of the runner.
-        agent: The root agent to run.
+        app_name: The application name of the runner. Required if `app` is not
+          provided.
+        agent: The root agent to run. Required if `app` is not provided.
+        app: An optional `App` instance. If provided, `app_name` and `agent`
+          should not be specified.
+        plugins: Deprecated. A list of plugins for the runner. Please use the
+          `app` argument to provide plugins instead.
         artifact_service: The artifact service for the runner.
         session_service: The session service for the runner.
         memory_service: The memory service for the runner.
+        credential_service: The credential service for the runner.
+
+    Raises:
+        ValueError: If `app` is provided along with `app_name` or `plugins`, or
+          if `app` is not provided but either `app_name` or `agent` is missing.
     """
-    self.app_name = app_name
-    self.agent = agent
+    self.app_name, self.agent, plugins = self._validate_runner_params(
+        app, app_name, agent, plugins
+    )
     self.artifact_service = artifact_service
     self.session_service = session_service
     self.memory_service = memory_service
     self.credential_service = credential_service
     self.plugin_manager = PluginManager(plugins=plugins)
+
+  def _validate_runner_params(
+      self,
+      app: Optional[App],
+      app_name: Optional[str],
+      agent: Optional[BaseAgent],
+      plugins: Optional[List[BasePlugin]],
+  ) -> tuple[str, BaseAgent, Optional[List[BasePlugin]]]:
+    """Validates and extracts runner parameters.
+
+    Args:
+        app: An optional `App` instance.
+        app_name: The application name of the runner.
+        agent: The root agent to run.
+        plugins: A list of plugins for the runner.
+
+    Returns:
+        A tuple containing (app_name, agent, plugins).
+
+    Raises:
+        ValueError: If parameters are invalid.
+    """
+    if app:
+      if app_name:
+        raise ValueError(
+            'When app is provided, app_name should not be provided.'
+        )
+      if agent:
+        raise ValueError('When app is provided, agent should not be provided.')
+      if plugins:
+        raise ValueError(
+            'When app is provided, plugins should not be provided and should be'
+            ' provided in the app instead.'
+        )
+      app_name = app.name
+      agent = app.root_agent
+      plugins = app.plugins
+    elif not app_name or not agent:
+      raise ValueError(
+          'Either app or both app_name and agent must be provided.'
+      )
+
+    if plugins:
+      warnings.warn(
+          'The `plugins` argument is deprecated. Please use the `app` argument'
+          ' to provide plugins instead.',
+          DeprecationWarning,
+      )
+    return app_name, agent, plugins
 
   def run(
       self,
@@ -122,7 +188,7 @@ class Runner:
       user_id: str,
       session_id: str,
       new_message: types.Content,
-      run_config: RunConfig = RunConfig(),
+      run_config: Optional[RunConfig] = None,
   ) -> Generator[Event, None, None]:
     """Runs the agent.
 
@@ -139,17 +205,21 @@ class Runner:
     Yields:
       The events generated by the agent.
     """
+    run_config = run_config or RunConfig()
     event_queue = queue.Queue()
 
     async def _invoke_run_async():
       try:
-        async for event in self.run_async(
-            user_id=user_id,
-            session_id=session_id,
-            new_message=new_message,
-            run_config=run_config,
-        ):
-          event_queue.put(event)
+        async with Aclosing(
+            self.run_async(
+                user_id=user_id,
+                session_id=session_id,
+                new_message=new_message,
+                run_config=run_config,
+            )
+        ) as agen:
+          async for event in agen:
+            event_queue.put(event)
       finally:
         event_queue.put(None)
 
@@ -179,7 +249,7 @@ class Runner:
       session_id: str,
       new_message: types.Content,
       state_delta: Optional[dict[str, Any]] = None,
-      run_config: RunConfig = RunConfig(),
+      run_config: Optional[RunConfig] = None,
   ) -> AsyncGenerator[Event, None]:
     """Main entry method to run the agent in this runner.
 
@@ -192,47 +262,56 @@ class Runner:
     Yields:
       The events generated by the agent.
     """
-    with tracer.start_as_current_span('invocation'):
-      session = await self.session_service.get_session(
-          app_name=self.app_name, user_id=user_id, session_id=session_id
-      )
-      if not session:
-        raise ValueError(f'Session not found: {session_id}')
+    run_config = run_config or RunConfig()
 
-      invocation_context = self._new_invocation_context(
-          session,
-          new_message=new_message,
-          run_config=run_config,
-      )
-      root_agent = self.agent
-
-      # Modify user message before execution.
-      modified_user_message = (
-          await invocation_context.plugin_manager.run_on_user_message_callback(
-              invocation_context=invocation_context, user_message=new_message
-          )
-      )
-      if modified_user_message is not None:
-        new_message = modified_user_message
-
-      if new_message:
-        await self._append_new_message_to_session(
-            session,
-            new_message,
-            invocation_context,
-            run_config.save_input_blobs_as_artifacts,
-            state_delta,
+    async def _run_with_trace(
+        new_message: types.Content,
+    ) -> AsyncGenerator[Event, None]:
+      with tracer.start_as_current_span('invocation'):
+        session = await self.session_service.get_session(
+            app_name=self.app_name, user_id=user_id, session_id=session_id
         )
+        if not session:
+          raise ValueError(f'Session not found: {session_id}')
 
-      invocation_context.agent = self._find_agent_to_run(session, root_agent)
+        invocation_context = self._new_invocation_context(
+            session,
+            new_message=new_message,
+            run_config=run_config,
+        )
+        root_agent = self.agent
 
-      async def execute(ctx: InvocationContext) -> AsyncGenerator[Event]:
-        async for event in ctx.agent.run_async(ctx):
-          yield event
+        # Modify user message before execution.
+        modified_user_message = await invocation_context.plugin_manager.run_on_user_message_callback(
+            invocation_context=invocation_context, user_message=new_message
+        )
+        if modified_user_message is not None:
+          new_message = modified_user_message
 
-      async for event in self._exec_with_plugin(
-          invocation_context, session, execute
-      ):
+        if new_message:
+          await self._append_new_message_to_session(
+              session,
+              new_message,
+              invocation_context,
+              run_config.save_input_blobs_as_artifacts,
+              state_delta,
+          )
+
+        invocation_context.agent = self._find_agent_to_run(session, root_agent)
+
+        async def execute(ctx: InvocationContext) -> AsyncGenerator[Event]:
+          async with Aclosing(ctx.agent.run_async(ctx)) as agen:
+            async for event in agen:
+              yield event
+
+        async with Aclosing(
+            self._exec_with_plugin(invocation_context, session, execute)
+        ) as agen:
+          async for event in agen:
+            yield event
+
+    async with Aclosing(_run_with_trace(new_message)) as agen:
+      async for event in agen:
         yield event
 
   async def _exec_with_plugin(
@@ -258,28 +337,34 @@ class Runner:
     early_exit_result = await plugin_manager.run_before_run_callback(
         invocation_context=invocation_context
     )
-    if isinstance(early_exit_result, Event):
+    if isinstance(early_exit_result, types.Content):
+      early_exit_event = Event(
+          invocation_id=invocation_context.invocation_id,
+          author='model',
+          content=early_exit_result,
+      )
       await self.session_service.append_event(
           session=session,
-          event=Event(
-              invocation_id=invocation_context.invocation_id,
-              author='model',
-              content=early_exit_result,
-          ),
+          event=early_exit_event,
       )
-      yield early_exit_result
+      yield early_exit_event
     else:
       # Step 2: Otherwise continue with normal execution
-      async for event in execute_fn(invocation_context):
-        if not event.partial:
-          await self.session_service.append_event(session=session, event=event)
-        # Step 3: Run the on_event callbacks to optionally modify the event.
-        modified_event = await plugin_manager.run_on_event_callback(
-            invocation_context=invocation_context, event=event
-        )
-        yield (modified_event if modified_event else event)
+      async with Aclosing(execute_fn(invocation_context)) as agen:
+        async for event in agen:
+          if not event.partial:
+            await self.session_service.append_event(
+                session=session, event=event
+            )
+          # Step 3: Run the on_event callbacks to optionally modify the event.
+          modified_event = await plugin_manager.run_on_event_callback(
+              invocation_context=invocation_context, event=event
+          )
+          yield (modified_event if modified_event else event)
 
-    # Step 4: Run the after_run callbacks to optionally modify the context.
+    # Step 4: Run the after_run callbacks to perform global cleanup tasks or
+    # finalizing logs and metrics data.
+    # This does NOT emit any event.
     await plugin_manager.run_after_run_callback(
         invocation_context=invocation_context
     )
@@ -343,7 +428,7 @@ class Runner:
       user_id: Optional[str] = None,
       session_id: Optional[str] = None,
       live_request_queue: LiveRequestQueue,
-      run_config: RunConfig = RunConfig(),
+      run_config: Optional[RunConfig] = None,
       session: Optional[Session] = None,
   ) -> AsyncGenerator[Event, None]:
     """Runs the agent in live mode (experimental feature).
@@ -369,6 +454,7 @@ class Runner:
     .. NOTE::
         Either `session` or both `user_id` and `session_id` must be provided.
     """
+    run_config = run_config or RunConfig()
     if session is None and (user_id is None or session_id is None):
       raise ValueError(
           'Either session or user_id and session_id must be provided.'
@@ -435,13 +521,15 @@ class Runner:
             )
 
     async def execute(ctx: InvocationContext) -> AsyncGenerator[Event]:
-      async for event in ctx.agent.run_live(ctx):
-        yield event
+      async with Aclosing(ctx.agent.run_live(ctx)) as agen:
+        async for event in agen:
+          yield event
 
-    async for event in self._exec_with_plugin(
-        invocation_context, session, execute
-    ):
-      yield event
+    async with Aclosing(
+        self._exec_with_plugin(invocation_context, session, execute)
+    ) as agen:
+      async for event in agen:
+        yield event
 
   def _find_agent_to_run(
       self, session: Session, root_agent: BaseAgent
@@ -516,7 +604,7 @@ class Runner:
       *,
       new_message: Optional[types.Content] = None,
       live_request_queue: Optional[LiveRequestQueue] = None,
-      run_config: RunConfig = RunConfig(),
+      run_config: Optional[RunConfig] = None,
   ) -> InvocationContext:
     """Creates a new invocation context.
 
@@ -529,6 +617,7 @@ class Runner:
     Returns:
         The new invocation context.
     """
+    run_config = run_config or RunConfig()
     invocation_id = new_invocation_context_id()
 
     if run_config.support_cfc and isinstance(self.agent, LlmAgent):
@@ -560,9 +649,10 @@ class Runner:
       session: Session,
       *,
       live_request_queue: Optional[LiveRequestQueue] = None,
-      run_config: RunConfig = RunConfig(),
+      run_config: Optional[RunConfig] = None,
   ) -> InvocationContext:
     """Creates a new invocation context for live multi-agent."""
+    run_config = run_config or RunConfig()
 
     # For live multi-agent, we need model's text transcription as context for
     # next agent.
@@ -637,10 +727,11 @@ class InMemoryRunner(Runner):
 
   def __init__(
       self,
-      agent: BaseAgent,
+      agent: Optional[BaseAgent] = None,
       *,
-      app_name: str = 'InMemoryRunner',
+      app_name: Optional[str] = 'InMemoryRunner',
       plugins: Optional[list[BasePlugin]] = None,
+      app: Optional[App] = None,
   ):
     """Initializes the InMemoryRunner.
 
@@ -655,6 +746,7 @@ class InMemoryRunner(Runner):
         agent=agent,
         artifact_service=InMemoryArtifactService(),
         plugins=plugins,
+        app=app,
         session_service=self._in_memory_session_service,
         memory_service=InMemoryMemoryService(),
     )

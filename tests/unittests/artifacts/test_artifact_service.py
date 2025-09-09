@@ -19,8 +19,8 @@ from typing import Optional
 from typing import Union
 from unittest import mock
 
-from google.adk.artifacts import GcsArtifactService
-from google.adk.artifacts import InMemoryArtifactService
+from google.adk.artifacts.gcs_artifact_service import GcsArtifactService
+from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
 from google.genai import types
 import pytest
 
@@ -258,8 +258,9 @@ async def test_list_versions(service_type):
       )
       for i in range(3)
   ]
+  versions.append(types.Part.from_text(text="hello"))
 
-  for i in range(3):
+  for i in range(4):
     await artifact_service.save_artifact(
         app_name=app_name,
         user_id=user_id,
@@ -275,4 +276,4 @@ async def test_list_versions(service_type):
       filename=filename,
   )
 
-  assert response_versions == list(range(3))
+  assert response_versions == list(range(4))
