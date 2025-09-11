@@ -91,7 +91,8 @@ root_agent = Agent(
              Explanation of why this change is necessary.
 
              **Reference**:
-             Reference to the code change.
+             Reference to the code change (e.g. https://github.com/google/adk-python/commit/b3b70035c432670a5f0b5cdd1e9467f43b80495c).
+             Reference to the code file (e.g. src/google/adk/tools/spanner/metadata_tool.py).
           ```
         - When referncing doc file, use the full relative path of the doc file in the ADK Docs repository (e.g. docs/sessions/memory.md).
       9. Create or recommend to create a Github issue in the Github Repository {DOC_REPO} with the instructions using the `create_issue` tool.
@@ -103,6 +104,13 @@ root_agent = Agent(
       - **File Paths:** Always use absolute paths when calling the tools to read files, list directories, or search the codebase.
       - **Tool Call Parallelism:** Execute multiple independent tool calls in parallel when feasible (i.e. searching the codebase).
       - **Explaination:** Provide concise explanations for your actions and reasoning for each step.
+      - **Reference:** For each recommended change, reference the code changes (i.e. links to the commits) **AND** the code files (i.e. relative paths to the code files in the codebase).
+      - **Sorting:** Sort the recommended changes by the importance of the changes, from the most important to the least important.
+        - Here are the importance groups: Feature changes > Bug fixes > Other changes.
+        - Within each importance group, sort the changes by the number of files they affect.
+        - Within each group of changes with the same number of files, sort by the number of lines changed in each file.
+      - **API Reference Updates:** ADK Docs repository has auto-generated API reference docs for the ADK Python codebase, which can be found in the "/docs/api-reference/python" directory.
+        - If a change in the codebase can be covered by the auto-generated API reference docs, you should just recommend to update the API reference docs (i.e. regenerate the API reference docs) instead of the other human-written ADK docs.
 
       # 5. Output
       Present the followings in an easy to read format as the final output to the user.
