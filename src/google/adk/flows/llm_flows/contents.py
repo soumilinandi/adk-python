@@ -58,6 +58,11 @@ class _ContentLlmRequestProcessor(BaseLlmRequestProcessor):
           agent.name,
       )
 
+    # Add dynamic instructions to the last user content if static instructions exist
+    await _add_dynamic_instructions_to_user_content(
+        invocation_context, llm_request
+    )
+
     # Maintain async generator behavior
     if False:  # Ensures it behaves as a generator
       yield  # This is a no-op but maintains generator structure
@@ -206,6 +211,7 @@ def _contains_empty_content(event: Event) -> bool:
   """Check if an event should be skipped due to missing or empty content.
 
   This can happen to the evnets that only changed session state.
+  When both content and transcriptions are empty, the event will be considered as empty.
 
   Args:
     event: The event to check.
@@ -218,7 +224,7 @@ def _contains_empty_content(event: Event) -> bool:
       or not event.content.role
       or not event.content.parts
       or event.content.parts[0].text == ''
-  )
+  ) and (not event.output_transcription and not event.input_transcription)
 
 
 def _get_contents(
@@ -236,9 +242,12 @@ def _get_contents(
   Returns:
     A list of processed contents.
   """
-  filtered_events = []
+  accumulated_input_transcription = ''
+  accumulated_output_transcription = ''
+
   # Parse the events, leaving the contents and the function calls and
   # responses from the current agent.
+  raw_filtered_events = []
   for event in events:
     if _contains_empty_content(event):
       continue
@@ -251,6 +260,45 @@ def _get_contents(
     if _is_request_confirmation_event(event):
       # Skip request confirmation events.
       continue
+
+    raw_filtered_events.append(event)
+
+  filtered_events = []
+  # aggregate transcription events
+  for i in range(len(raw_filtered_events)):
+    event = raw_filtered_events[i]
+    if not event.content:
+      # Convert transcription into normal event
+      if event.input_transcription and event.input_transcription.text:
+        accumulated_input_transcription += event.input_transcription.text
+        if (
+            i != len(raw_filtered_events) - 1
+            and raw_filtered_events[i + 1].input_transcription
+            and raw_filtered_events[i + 1].input_transcription.text
+        ):
+          continue
+        event = event.model_copy(deep=True)
+        event.input_transcription = None
+        event.content = types.Content(
+            role='user',
+            parts=[types.Part(text=accumulated_input_transcription)],
+        )
+        accumulated_input_transcription = ''
+      elif event.output_transcription and event.output_transcription.text:
+        accumulated_output_transcription += event.output_transcription.text
+        if (
+            i != len(raw_filtered_events) - 1
+            and raw_filtered_events[i + 1].output_transcription
+            and raw_filtered_events[i + 1].output_transcription.text
+        ):
+          continue
+        event = event.model_copy(deep=True)
+        event.output_transcription = None
+        event.content = types.Content(
+            role='model',
+            parts=[types.Part(text=accumulated_output_transcription)],
+        )
+        accumulated_output_transcription = ''
 
     if _is_other_agent_reply(agent_name, event):
       if converted_event := _present_other_agent_message(event):
@@ -474,3 +522,89 @@ def _is_auth_event(event: Event) -> bool:
 def _is_request_confirmation_event(event: Event) -> bool:
   """Checks if the event is a request confirmation event."""
   return _is_function_call_event(event, REQUEST_CONFIRMATION_FUNCTION_CALL_NAME)
+
+
+def _is_live_model_audio_event(event: Event) -> bool:
+  """Check if the event is an audio event produced by live/bidi models
+
+  There are two possible cases:
+  content=Content(
+    parts=[
+      Part(
+        file_data=FileData(
+          file_uri='artifact://live_bidi_streaming_multi_agent/user/cccf0b8b-4a30-449a-890e-e8b8deb661a1/_adk_live/adk_live_audio_storage_input_audio_1756092402277.pcm#1',
+          mime_type='audio/pcm'
+        )
+      ),
+    ],
+    role='user'
+  )
+  content=Content(
+    parts=[
+      Part(
+        inline_data=Blob(
+          data=b'\x01\x00\x00...',
+          mime_type='audio/pcm'
+        )
+      ),
+    ],
+    role='model'
+  ) grounding_metadata=None partial=None turn_complete=None finish_reason=None error_code=None error_message=None ...
+  """
+  if not event.content:
+    return False
+  if not event.content.parts:
+    return False
+  # If it's audio data, then one event only has one part of audio.
+  for part in event.content.parts:
+    if part.inline_data and part.inline_data.mime_type == 'audio/pcm':
+      return True
+    if part.file_data and part.file_data.mime_type == 'audio/pcm':
+      return True
+  return False
+
+
+async def _add_dynamic_instructions_to_user_content(
+    invocation_context: InvocationContext, llm_request: LlmRequest
+) -> None:
+  """Add dynamic instructions to the last user content when static instructions exist."""
+  from ...agents.readonly_context import ReadonlyContext
+  from ...utils import instructions_utils
+
+  agent = invocation_context.agent
+
+  dynamic_instructions = []
+
+  # Handle agent dynamic instructions if static instruction exists
+  if agent.static_instruction and agent.instruction:
+    # Static instruction exists, so add dynamic instruction to content
+    raw_si, bypass_state_injection = await agent.canonical_instruction(
+        ReadonlyContext(invocation_context)
+    )
+    si = raw_si
+    if not bypass_state_injection:
+      si = await instructions_utils.inject_session_state(
+          raw_si, ReadonlyContext(invocation_context)
+      )
+    if si:  # Only add if not empty
+      dynamic_instructions.append(si)
+
+  if not dynamic_instructions:
+    return
+
+  # Find the start of the last continuous batch of user content
+  # Walk backwards to find the first non-user content, then insert before next user content
+  insert_index = len(llm_request.contents)
+  for i in range(len(llm_request.contents) - 1, -1, -1):
+    if llm_request.contents[i].role != 'user':
+      insert_index = i + 1
+      break
+    elif i == 0:
+      # All content from start is user content
+      insert_index = 0
+      break
+
+  # Create new user content with dynamic instructions
+  instruction_parts = [types.Part(text=instr) for instr in dynamic_instructions]
+  new_content = types.Content(role='user', parts=instruction_parts)
+  llm_request.contents.insert(insert_index, new_content)
