@@ -14,6 +14,12 @@ For comprehensive information about using NVIDIA models with LiteLLM, refer to t
 
 ### 2. Ensure LiteLLM is Installed
 
+Install LiteLLM if you haven't already:
+
+```bash
+pip install litellm
+```
+
 
 ## Using NVIDIA Models in ADK
 
@@ -64,8 +70,8 @@ models = [
 
 ADK uses LiteLLM as a wrapper to access NVIDIA NIM models. The integration:
 
-1. **Model Format**: Uses `nvidia_nim/provider/model-name` format
+1. **Model Format**: Uses `nvidia_nim/<organization>/<model-name>` format
 2. **Authentication**: Requires `NVIDIA_NIM_API_KEY` environment variable
 3. **Base URL**: Optional `NVIDIA_NIM_API_BASE` for custom endpoints
 4. **Compatibility**: Works with all ADK features (tools, sessions, etc.)
-5. **Supported Endpoints**: `/chat/completions`, `/completions`, `/responses`, `/embeddings` 
+5. **Supported Endpoints**: `/chat/completions`, `/completions`, `/embeddings` 
